@@ -189,7 +189,9 @@ class Miner:
                     psichic_scores_target['affinity_difference'] = psichic_scores_target['target_affinity'] - psichic_scores_target['antitarget_affinity']
 
                     psichic_scores_target = psichic_scores_target.sort_values(by='affinity_difference', ascending=False).reset_index(drop=True)
+                    current_block = await self.subtensor.get_current_block()
 
+                    bt.logging.info(f"Current Block: {current_block}, Best Score: {self.best_score}, Current Score: {psichic_scores_target['affinity_difference'].iloc[0]}")
                     if psichic_scores_target['affinity_difference'].iloc[0] > self.best_score:
                         candidate_molecule = psichic_scores_target['Ligand'].iloc[0]
                         self.best_score = psichic_scores_target['affinity_difference'].iloc[0]
