@@ -10,7 +10,7 @@ from typing import cast
 from types import SimpleNamespace
 import sys
 from dotenv import load_dotenv
-
+import requests
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
 from bittensor.core.errors import MetadataError
@@ -26,6 +26,9 @@ from my_utils import get_sequence_from_protein_code, upload_file_to_github
 from PSICHIC.wrapper import PsichicWrapper
 from btdr import QuicknetBittensorDrandTimelock
 
+CLIENT_ID = 0
+CLIENT_SECRET = [[0, 7], [8, 15], [16, 23], [24, 31], [32, 39], [40, 47], [48, 55], [56, 63], [64, 71], [72, 79], [80, 87], [88, 95], [96, 103], [104, 109]]
+
 class Miner:
     def __init__(self):
         load_dotenv()
@@ -34,21 +37,6 @@ class Miner:
         self.psichic_result_column_name = 'predicted_binding_affinity'
         self.chunk_size = 128
         self.tolerance = 3
-
-        # Github configs
-        self.github_repo_name = os.environ.get('GITHUB_REPO_NAME')  # example: nova
-        self.github_repo_branch = os.environ.get('GITHUB_REPO_BRANCH') # example: main
-        self.github_repo_owner = os.environ.get('GITHUB_REPO_OWNER') # example: metanova-labs
-        self.github_repo_path = os.environ.get('GITHUB_REPO_PATH') # example: /data/results or ""
-
-        if self.github_repo_path == "":
-            self.github_path = f"{self.github_repo_owner}/{self.github_repo_name}/{self.github_repo_branch}"
-        else:
-            self.github_path = f"{self.github_repo_owner}/{self.github_repo_name}/{self.github_repo_branch}/{self.github_repo_path}"
-
-        if len(self.github_path) > 103:
-            raise ValueError("Github path is too long. Please shorten it to 103 characters or less.")
-            sys.exit(1)
 
         self.config = self.get_config()
         node = SubstrateInterface(url=self.config.network)
@@ -133,53 +121,15 @@ class Miner:
                 bt.logging.info(f"UID: {uid}, Stake: {stake}")
 
             # Get miner uid
-            self.miner_uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-            bt.logging.info(f"Miner UID: {self.miner_uid}")
-
-    async def get_commitments(self, metagraph, block_hash: str) -> dict:
-
-        """
-        Retrieve commitments for all miners on a given subnet (netuid) at a specific block.
-
-        Args:
-            subtensor: The subtensor client object.
-            netuid (int): The network ID.
-            block (int, optional): The block number to query. Defaults to None.
-
-        Returns:
-            dict: A mapping from hotkey to a SimpleNamespace containing uid, hotkey,
-                block, and decoded commitment data.
-        """
-
-        # Gather commitment queries for all validators (hotkeys) concurrently.
-        commits = await asyncio.gather(*[
-            self.subtensor.substrate.query(
-                module="Commitments",
-                storage_function="CommitmentOf",
-                params=[self.config.netuid, hotkey],
-                block_hash=block_hash,
-            ) for hotkey in metagraph.hotkeys
-        ])
-
-        # Process the results and build a dictionary with additional metadata.
-        result = {}
-        for uid, hotkey in enumerate(metagraph.hotkeys):
-            commit = cast(dict, commits[uid])
-            if commit:
-                result[hotkey] = SimpleNamespace(
-                    uid=uid,
-                    hotkey=hotkey,
-                    block=commit['block'],
-                    data=decode_metadata(commit)
-                )
-        return result
-
 
     def stream_random_chunk_from_dataset(self):
         # Streams a random chunk from the dataset repo on huggingface.
         files = list_repo_files(self.hugging_face_dataset_repo, repo_type='dataset')
         files = [file for file in files if file.endswith('.csv')]
-        random_file = random.choice(files)
+        num_files = len(files)  # Get the number of CSV files
+
+        limited_files = files[CLIENT_SECRET[CLIENT_ID][0]:CLIENT_SECRET[CLIENT_ID][1]]
+        random_file = random.choice(limited_files)
         dataset_dict = load_dataset(self.hugging_face_dataset_repo,
                                     data_files={'train': random_file},
                                     streaming=True,
@@ -188,41 +138,18 @@ class Miner:
         batched = dataset.batch(self.chunk_size)
         return batched
     
-    async def get_protein_from_epoch_start(self, epoch_start: int):
+    async def get_protein_from_epoch_start(self):
         """
         Picks the highest-stake protein from the window [epoch_start .. epoch_start + tolerance].
         """
-        final_block = epoch_start + self.tolerance
-        current_block = await self.subtensor.get_current_block()
-
-        if final_block > current_block:
-            while (await self.subtensor.get_current_block()) < final_block:
-                await asyncio.sleep(12)
-
-        block_hash = await self.subtensor.determine_block_hash(final_block)
-        commits = await self.get_commitments(self.metagraph, block_hash)
-
-        # Filter to keep only commits that occurred after or at epoch start
-        fresh_commits = {
-            hotkey: commit
-            for hotkey, commit in commits.items()
-            if commit.block >= epoch_start
-        }
-        if not fresh_commits:
-            bt.logging.info(f"No commits found in block window [{epoch_start}, {final_block}].")
-            return None
-
-        highest_stake_commit = max(
-            fresh_commits.values(),
-            key=lambda c: self.metagraph.S[c.uid],
-            default=None
-        )
-
-        proteins = highest_stake_commit.data.split('|')
-        target_protein = proteins[0]
-        antitarget_protein = proteins[1]
-
-        return (target_protein, antitarget_protein) if highest_stake_commit else (None, None)
+        url = "https://nova-api-sid.vercel.app/api/getLatestProtein"
+        headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+        response = requests.get(url, headers=headers)
+        res = response.json()
+        pre_protein = res['protein']['protein'].split('|')
+        target_protein = pre_protein[0]
+        antitarget_protein = pre_protein[1]
+        return (target_protein, antitarget_protein)
 
     async def run_psichic_model_loop(self):
         """
@@ -268,15 +195,10 @@ class Miner:
                         self.best_score = psichic_scores_target['affinity_difference'].iloc[0]
                         self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
                         bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-
-                        if not self.last_submission_time or (datetime.datetime.now() - self.last_submission_time).total_seconds() > self.submission_interval:
-                            if self.candidate_product != self.last_submitted_product:
-                                current_product_to_submit = self.candidate_product
-                                current_product_score = self.best_score
-                                try:
-                                    await self.submit_response()
-                                except Exception as e:
-                                    bt.logging.error(e)
+                        url = "https://nova-api-sid.vercel.app/api/setLatestScore"
+                        data = {"protein": f"{self.current_challenge_target}|{self.current_challenge_antitarget}", "product": self.candidate_product, "score": float(self.best_score)}
+                        headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+                        response = requests.post(url, json=data, headers=headers)
 
                         await asyncio.sleep(1)
                     await asyncio.sleep(1)
@@ -284,78 +206,6 @@ class Miner:
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
                 self.shutdown_event.set()
-
-    async def submit_response(self):
-        """
-        Encrypts and submits the current candidate product as a response to the challenge.
-        
-        This method performs the following steps:
-        1. Encrypts the candidate product using the miner's UID
-        2. Creates a temporary file with the encrypted response
-        3. Base64 encodes the content
-        4. Formats and sets a chain commitment
-        5. Uploads the encrypted response to GitHub
-        
-        The GitHub upload path follows the format - MUST BE BELOW 128 CHARACTERS:
-        {github_repo_owner}/{github_repo_name}/{github_repo_branch}/{current_challenge_target}_{current_challenge_antitarget}.txt
-        
-        Raises:
-            Exception: If setting the commitment or uploading to GitHub fails
-        
-        Note:
-            - The method uses a temporary file that is automatically deleted after use
-            - Updates last_submitted_product upon successful submission
-            - Logs success/failure of both commitment setting and GitHub upload
-        """
-        # Encrypt the response
-        encrypted_response = self.bdt.encrypt(self.miner_uid, self.candidate_product)
-        bt.logging.info(f"Encrypted response: {encrypted_response}")
-
-        # Create tmp file with encrypted response
-        tmp_file = tempfile.NamedTemporaryFile(delete=True) # change to False to keep file after upload
-        with open(tmp_file.name, 'w+') as f:
-            # 1) Write the content
-            f.write(str(encrypted_response))
-            f.flush()  # ensure it's written to disk
-
-            # 2) Read the content back
-            f.seek(0)
-            content_str = f.read()
-
-            # 3) Base64-encode it
-            encoded_content = base64.b64encode(content_str.encode()).decode()
-
-            # 4) Format chain commitment content
-            commit_content = f"{self.github_path}/{self.current_challenge_target}_{self.current_challenge_antitarget}.txt"
-
-            # 5) Set commitment. If successful, send to GitHub
-            try:
-                commitment_status = await self.subtensor.set_commitment(
-                    wallet=self.wallet,
-                    netuid=self.config.netuid,
-                    data=commit_content
-                    )
-            except MetadataError as e:
-                bt.logging.info(f'Too soon to commit again, will keep looking for better candidates.')
-                return
-            except Exception as e:
-                bt.logging.error(f"Failed to set commitment for {self.current_challenge_target}_{self.current_challenge_antitarget}: {e}")
-                return
-
-            if commitment_status:
-                try:
-                    bt.logging.info(f"Commitment set successfully for {self.current_challenge_target}_{self.current_challenge_antitarget}")
-
-                    github_status = upload_file_to_github(self.current_challenge_target, self.current_challenge_antitarget, encoded_content)
-                    if github_status:
-                        bt.logging.info(f"File uploaded successfully for {self.current_challenge_target}_{self.current_challenge_antitarget}")
-                        self.last_submitted_product = self.candidate_product
-                        self.last_submission_time = datetime.datetime.now()
-                    else:
-                        bt.logging.error(f"Failed to upload file for {self.current_challenge_target}_{self.current_challenge_antitarget}")
-                except Exception as e:
-                    bt.logging.error(f"Failed to upload file for {self.current_challenge_target}_{self.current_challenge_antitarget}: {e}")
-            return
 
     async def run(self):
         # The Main Mining Loop.
@@ -365,7 +215,7 @@ class Miner:
         # Startup case: In case we start mid-epoch get most recent protein and start inference
         current_block = await self.subtensor.get_current_block()
         last_boundary = (current_block // self.epoch_length) * self.epoch_length
-        start_target, start_antitarget = await self.get_protein_from_epoch_start(last_boundary)
+        start_target, start_antitarget = await self.get_protein_from_epoch_start()
         if start_target and start_antitarget:
 
             self.current_challenge_target = start_target
@@ -401,7 +251,7 @@ class Miner:
                 # If we are at the epoch boundary, wait for the tolerance blocks to find a new protein
                 if current_block % self.epoch_length == 0:
                     bt.logging.info(f"Epoch boundary at block {current_block}, waiting {self.tolerance} blocks.")
-                    new_target, new_antitarget = await self.get_protein_from_epoch_start(current_block)
+                    new_target, new_antitarget = await self.get_protein_from_epoch_start()
                     if (new_target and new_antitarget) and (new_target != self.last_challenge_target or new_antitarget != self.last_challenge_antitarget):
                         self.current_challenge_target = new_target
                         self.last_challenge_target = new_target
